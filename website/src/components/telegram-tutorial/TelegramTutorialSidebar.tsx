@@ -50,6 +50,8 @@ export default function TelegramTutorialSidebar() {
     const el = document.getElementById(id)
     if (el) {
       el.scrollIntoView({ behavior: 'smooth' })
+      const base = window.location.hash.split('?')[0]
+      window.history.replaceState(null, '', `${base}?s=${id}`)
     }
   }
 

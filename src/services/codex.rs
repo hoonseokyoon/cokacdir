@@ -39,30 +39,13 @@ fn resolve_codex_path() -> Option<String> {
 
 #[cfg(windows)]
 fn resolve_codex_path() -> Option<String> {
-    if let Ok(output) = Command::new("where").arg("codex").output() {
-        if output.status.success() {
-            let all = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            // On Windows, npm installs both `codex` (Unix shell script) and
-            // `codex.cmd` (Windows batch wrapper).  `where codex` may return both.
-            // We must prefer the .cmd variant; the bare file is not executable.
-            let lines: Vec<&str> = all.lines().collect();
-
-            // 1) Prefer a .cmd line directly from `where` output
-            if let Some(cmd) = lines.iter().find(|l| l.ends_with(".cmd")) {
-                return Some(cmd.to_string());
-            }
-
-            // 2) If only the bare file was returned, check if a .cmd sibling exists
-            if let Some(first) = lines.first() {
-                if !first.is_empty() {
-                    let cmd_sibling = format!("{}.cmd", first);
-                    if std::path::Path::new(&cmd_sibling).exists() {
-                        return Some(cmd_sibling);
-                    }
-                    return Some(first.to_string());
-                }
-            }
-        }
+    // Use SearchPathW (UTF-16 native) — no code page issues with non-ASCII paths
+    // Prefer .cmd (npm batch wrapper) over bare file (Unix shell script)
+    if let Some(path) = crate::services::claude::search_path_wide("codex", Some(".cmd")) {
+        return Some(path);
+    }
+    if let Some(path) = crate::services::claude::search_path_wide("codex", Some(".exe")) {
+        return Some(path);
     }
     None
 }

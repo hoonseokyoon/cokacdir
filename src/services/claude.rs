@@ -76,25 +76,118 @@ fn resolve_claude_path() -> Option<String> {
     None
 }
 
+/// Decode bytes from Windows console command output into a UTF-8 String.
+/// Windows commands like `where` output text in the system code page (e.g., CP949 for Korean),
+/// not UTF-8. This function tries multiple code pages to ensure correct decoding:
+///   1. UTF-8 (fast path — covers systems with UTF-8 locale enabled)
+///   2. OEM code page (CP_OEMCP — what most console commands use)
+///   3. ANSI code page (CP_ACP — fallback when OEM decoding produces an invalid path)
 #[cfg(windows)]
-fn resolve_claude_path() -> Option<String> {
-    // Try `where claude` on Windows
-    if let Ok(output) = Command::new("where").arg("claude").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let lines: Vec<&str> = path.lines().filter(|l| !l.is_empty()).collect();
-            // Prefer .cmd or .exe over extensionless (which is a unix shell script)
-            if let Some(win_path) = lines.iter().find(|l| {
-                let lower = l.to_lowercase();
-                lower.ends_with(".cmd") || lower.ends_with(".exe")
-            }) {
-                return Some(win_path.to_string());
+pub fn decode_windows_output(bytes: &[u8]) -> String {
+    // Fast path: if it's already valid UTF-8, no conversion needed
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+
+    extern "system" {
+        fn MultiByteToWideChar(
+            code_page: u32, flags: u32,
+            src: *const u8, src_len: i32,
+            dst: *mut u16, dst_len: i32,
+        ) -> i32;
+    }
+    const CP_OEMCP: u32 = 1; // System OEM code page (e.g., CP949 for Korean)
+    const CP_ACP: u32 = 0;   // System ANSI code page (e.g., CP1252 for Western European)
+
+    let decode_with_cp = |cp: u32| -> Option<String> {
+        unsafe {
+            let len = MultiByteToWideChar(
+                cp, 0, bytes.as_ptr(), bytes.len() as i32, std::ptr::null_mut(), 0,
+            );
+            if len <= 0 {
+                return None;
             }
-            // Fallback: take the first result
-            if let Some(first) = lines.first() {
-                return Some(first.to_string());
+            let mut wide = vec![0u16; len as usize];
+            MultiByteToWideChar(
+                cp, 0, bytes.as_ptr(), bytes.len() as i32, wide.as_mut_ptr(), len,
+            );
+            Some(String::from_utf16_lossy(&wide))
+        }
+    };
+
+    // Try OEM first (most console commands use this), verify the path exists
+    if let Some(oem) = decode_with_cp(CP_OEMCP) {
+        let first_line = oem.trim().lines().next().unwrap_or("");
+        if first_line.is_empty() || std::path::Path::new(first_line).exists() {
+            return oem;
+        }
+        // OEM decoded but path doesn't exist — try ANSI
+        if let Some(ansi) = decode_with_cp(CP_ACP) {
+            let ansi_first = ansi.trim().lines().next().unwrap_or("");
+            if std::path::Path::new(ansi_first).exists() {
+                return ansi;
             }
         }
+        // Neither exists — return OEM result (less likely to be wrong)
+        return oem;
+    }
+
+    // OEM decode failed entirely — try ANSI
+    if let Some(ansi) = decode_with_cp(CP_ACP) {
+        return ansi;
+    }
+
+    String::from_utf8_lossy(bytes).to_string()
+}
+
+/// Search for an executable using Windows SearchPathW API.
+/// Returns the full path as UTF-8, with no code page conversion issues
+/// since SearchPathW operates entirely in UTF-16.
+#[cfg(windows)]
+pub fn search_path_wide(name: &str, ext: Option<&str>) -> Option<String> {
+    extern "system" {
+        fn SearchPathW(
+            path: *const u16,
+            file_name: *const u16,
+            extension: *const u16,
+            buffer_len: u32,
+            buffer: *mut u16,
+            file_part: *mut *mut u16,
+        ) -> u32;
+    }
+
+    let name_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let ext_w: Option<Vec<u16>> = ext.map(|e| e.encode_utf16().chain(std::iter::once(0)).collect());
+    let ext_ptr = ext_w.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
+
+    unsafe {
+        let needed = SearchPathW(
+            std::ptr::null(), name_w.as_ptr(), ext_ptr,
+            0, std::ptr::null_mut(), std::ptr::null_mut(),
+        );
+        if needed == 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; needed as usize];
+        let written = SearchPathW(
+            std::ptr::null(), name_w.as_ptr(), ext_ptr,
+            needed, buf.as_mut_ptr(), std::ptr::null_mut(),
+        );
+        if written == 0 || written >= needed {
+            return None;
+        }
+        String::from_utf16(&buf[..written as usize]).ok()
+    }
+}
+
+#[cfg(windows)]
+fn resolve_claude_path() -> Option<String> {
+    // Use SearchPathW (UTF-16 native) — no code page issues with non-ASCII paths
+    if let Some(path) = search_path_wide("claude", Some(".exe")) {
+        return Some(path);
+    }
+    if let Some(path) = search_path_wide("claude", Some(".cmd")) {
+        return Some(path);
     }
 
     // Fallback: check npm global install paths
@@ -103,7 +196,7 @@ fn resolve_claude_path() -> Option<String> {
         .output()
     {
         if output.status.success() {
-            let npm_root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let npm_root = decode_windows_output(&output.stdout).trim().to_string();
             let claude_path = std::path::Path::new(&npm_root)
                 .join("@anthropic-ai")
                 .join("claude-code")

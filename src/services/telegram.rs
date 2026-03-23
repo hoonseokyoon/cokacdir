@@ -2197,58 +2197,96 @@ async fn handle_message(
 
     // Normalize "@botname ..." → strip @botname prefix (group chat shorthand)
     // "@botname /cmd args" → "/cmd args", "@botname hello" → ";hello"
+    // In direct mode, ignore messages that mention a different bot
+    let starts_with_at = raw_text.starts_with('@');
+    let has_bot_username = !bot_username.is_empty();
+    msg_debug(&format!("[mention_routing] input: raw_text={:?}, bot_username={:?}, starts_with_at={}, has_bot_username={}, require_prefix={}, is_group_chat={}",
+        truncate_str(raw_text, 100), bot_username, starts_with_at, has_bot_username, require_prefix, is_group_chat));
     let mention_rewritten: Option<String>;
-    let raw_text = if !bot_username.is_empty() && raw_text.starts_with('@') {
+    let raw_text = if has_bot_username && starts_with_at {
         let prefix = format!("@{} ", bot_username);
-        if raw_text.to_lowercase().starts_with(&prefix) {
+        let is_self_mention = raw_text.to_lowercase().starts_with(&prefix);
+        msg_debug(&format!("[mention_routing] @-prefix detected: checking self-mention, prefix={:?}, is_self_mention={}", prefix, is_self_mention));
+        if is_self_mention {
             let body = raw_text[prefix.len()..].trim_start();
             if body.starts_with('/') || body.starts_with('!') || body.starts_with(';') {
-                msg_debug(&format!("[handle_message] @botname rewrite: {:?} → {:?}", raw_text, body));
+                msg_debug(&format!("[mention_routing] self-mention with command prefix: {:?} → {:?} (pass-through command char)", raw_text, body));
                 mention_rewritten = Some(body.to_string());
             } else {
                 let prefixed = format!(";{}", body);
-                msg_debug(&format!("[handle_message] @botname rewrite: {:?} → {:?}", raw_text, prefixed));
+                msg_debug(&format!("[mention_routing] self-mention with plain text: {:?} → {:?} (added ; prefix)", raw_text, prefixed));
                 mention_rewritten = Some(prefixed);
             }
             mention_rewritten.as_deref().unwrap()
         } else {
+            // Message starts with @ but mentions a different bot
+            let mentioned = raw_text[1..].split_whitespace().next().unwrap_or("");
+            msg_debug(&format!("[mention_routing] other-bot mention: mentioned={:?}, require_prefix={}, direct_mode={}", mentioned, require_prefix, !require_prefix));
+            if is_group_chat && !require_prefix {
+                // Direct mode ON (group chat): ignore messages for other bots
+                if !mentioned.is_empty() && mentioned.to_lowercase() != bot_username {
+                    msg_debug(&format!("[mention_routing] IGNORED: direct mode ON, message is for @{}, not for @{}", mentioned, bot_username));
+                    return Ok(());
+                }
+                msg_debug(&format!("[mention_routing] direct mode ON, but mentioned={:?} matches self or is empty, passing through", mentioned));
+            } else {
+                msg_debug(&format!("[mention_routing] direct mode OFF, passing through raw_text as-is (will be filtered by require_prefix later)"));
+            }
             raw_text
         }
     } else {
+        if starts_with_at {
+            msg_debug(&format!("[mention_routing] starts with @ but bot_username is empty, passing through"));
+        } else {
+            msg_debug(&format!("[mention_routing] no @-prefix, passing through raw_text as-is"));
+        }
         raw_text
     };
 
     // Strip @botname suffix from commands (e.g. "/pwd@mybot" → "/pwd")
     // If @botname doesn't match this bot, ignore the command (it's for another bot)
-    let text = if raw_text.starts_with('/') {
+    let starts_with_slash = raw_text.starts_with('/');
+    msg_debug(&format!("[cmd_routing] input: raw_text={:?}, starts_with_slash={}", truncate_str(raw_text, 100), starts_with_slash));
+    let text = if starts_with_slash {
         if let Some(space_pos) = raw_text.find(' ') {
             // "/cmd@bot args" → "/cmd args"
             let cmd_part = &raw_text[..space_pos];
             let args_part = &raw_text[space_pos..];
             if let Some(at_pos) = cmd_part.find('@') {
                 let mentioned = &cmd_part[at_pos + 1..];
-                if !bot_username.is_empty() && mentioned.to_lowercase() != bot_username {
-                    msg_debug(&format!("[handle_message] ignoring command for other bot: @{}", mentioned));
+                let is_self = mentioned.to_lowercase() == bot_username;
+                msg_debug(&format!("[cmd_routing] slash+args: cmd={:?}, mentioned={:?}, is_self={}, bot_username={:?}", cmd_part, mentioned, is_self, bot_username));
+                if has_bot_username && !is_self {
+                    msg_debug(&format!("[cmd_routing] IGNORED: command {:?} is for @{}, not for @{}", cmd_part, mentioned, bot_username));
                     return Ok(());
                 }
-                format!("{}{}", &cmd_part[..at_pos], args_part)
+                let result = format!("{}{}", &cmd_part[..at_pos], args_part);
+                msg_debug(&format!("[cmd_routing] stripped @mention from command: {:?} → {:?}", raw_text, result));
+                result
             } else {
+                msg_debug(&format!("[cmd_routing] slash+args, no @mention: {:?} → all bots", raw_text));
                 raw_text.to_string()
             }
         } else {
             // "/cmd@bot" (no args) → "/cmd"
             if let Some(at_pos) = raw_text.find('@') {
                 let mentioned = &raw_text[at_pos + 1..];
-                if !bot_username.is_empty() && mentioned.to_lowercase() != bot_username {
-                    msg_debug(&format!("[handle_message] ignoring command for other bot: @{}", mentioned));
+                let is_self = mentioned.to_lowercase() == bot_username;
+                msg_debug(&format!("[cmd_routing] slash-only: cmd={:?}, mentioned={:?}, is_self={}, bot_username={:?}", raw_text, mentioned, is_self, bot_username));
+                if has_bot_username && !is_self {
+                    msg_debug(&format!("[cmd_routing] IGNORED: command {:?} is for @{}, not for @{}", raw_text, mentioned, bot_username));
                     return Ok(());
                 }
-                raw_text[..at_pos].to_string()
+                let result = raw_text[..at_pos].to_string();
+                msg_debug(&format!("[cmd_routing] stripped @mention from command: {:?} → {:?}", raw_text, result));
+                result
             } else {
+                msg_debug(&format!("[cmd_routing] slash-only, no @mention: {:?} → all bots", raw_text));
                 raw_text.to_string()
             }
         }
     } else {
+        msg_debug(&format!("[cmd_routing] not a slash command, text={:?}", truncate_str(raw_text, 100)));
         raw_text.to_string()
     };
     let preview = &text;
@@ -2259,8 +2297,10 @@ async fn handle_message(
     }
 
     // In group chats (with prefix required), ignore plain text (only /, !, ; prefixed messages are processed)
-    if require_prefix && !text.starts_with('/') && !text.starts_with('!') && !text.starts_with(';') {
-        msg_debug(&format!("[handle_message] chat_id={}, require_prefix=true, ignoring plain text", chat_id.0));
+    let has_valid_prefix = text.starts_with('/') || text.starts_with('!') || text.starts_with(';');
+    msg_debug(&format!("[prefix_filter] text={:?}, require_prefix={}, has_valid_prefix={}, direct_mode={}", truncate_str(&text, 100), require_prefix, has_valid_prefix, !require_prefix));
+    if require_prefix && !has_valid_prefix {
+        msg_debug(&format!("[prefix_filter] IGNORED: require_prefix=true (direct mode OFF), no valid prefix in text={:?}", truncate_str(&text, 80)));
         // Clear pending uploads — this message was not for this bot,
         // so any previously shared location/file data should be discarded.
         let mut data = state.lock().await;

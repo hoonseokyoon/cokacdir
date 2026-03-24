@@ -67,11 +67,13 @@ fn check_gemini_available() -> bool {
 
     #[cfg(windows)]
     {
-        if let Ok(output) = Command::new("where").arg("gemini").output() {
-            if output.status.success() {
-                gemini_debug("[check_gemini_available] found via where");
-                return true;
-            }
+        if let Some(path) = crate::services::claude::search_path_wide("gemini", Some(".cmd")) {
+            gemini_debug(&format!("[check_gemini_available] found via search_path_wide .cmd: {}", path));
+            return true;
+        }
+        if let Some(path) = crate::services::claude::search_path_wide("gemini", Some(".exe")) {
+            gemini_debug(&format!("[check_gemini_available] found via search_path_wide .exe: {}", path));
+            return true;
         }
     }
 

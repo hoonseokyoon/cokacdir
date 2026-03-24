@@ -139,13 +139,11 @@ fn resolve_gemini_path() -> Option<String> {
 
     #[cfg(windows)]
     {
-        if let Ok(output) = Command::new("where").arg("gemini").output() {
-            if output.status.success() {
-                let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if let Some(first) = p.lines().next() {
-                    if !first.is_empty() { return Some(first.to_string()); }
-                }
-            }
+        if let Some(path) = crate::services::claude::search_path_wide("gemini", Some(".cmd")) {
+            return Some(path);
+        }
+        if let Some(path) = crate::services::claude::search_path_wide("gemini", Some(".exe")) {
+            return Some(path);
         }
     }
 

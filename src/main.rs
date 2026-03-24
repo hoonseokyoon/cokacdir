@@ -22,6 +22,8 @@ use ratatui::{
 use crate::ui::app::{App, Screen};
 use crate::services::claude;
 use crate::services::codex;
+use crate::services::gemini;
+use crate::services::opencode;
 use crate::utils::markdown::{render_markdown, MarkdownTheme, is_line_empty};
 use crate::keybindings::PanelAction;
 
@@ -647,13 +649,15 @@ fn handle_ccserver(tokens: Vec<String>) {
     // Check provider availability
     let has_claude = claude::is_claude_available();
     let has_codex = codex::is_codex_available();
+    let has_gemini = gemini::is_gemini_available();
+    let has_opencode = opencode::is_opencode_available();
     let mark = |available: bool| if available { "✓" } else { "✗" };
-    println!("  ▸ Providers    : claude {}  codex {}", mark(has_claude), mark(has_codex));
+    println!("  ▸ Providers    : claude {}  codex {}  gemini {}  opencode {}", mark(has_claude), mark(has_codex), mark(has_gemini), mark(has_opencode));
 
-    if !has_claude && !has_codex {
+    if !has_claude && !has_codex && !has_gemini && !has_opencode {
         eprintln!();
         eprintln!("  Error: No AI provider available.");
-        eprintln!("  Install Claude CLI (https://claude.ai/cli) or Codex CLI.");
+        eprintln!("  Install Claude CLI, Codex CLI, Gemini CLI, or OpenCode.");
         return;
     }
     println!();

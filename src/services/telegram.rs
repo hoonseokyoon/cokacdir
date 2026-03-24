@@ -5150,10 +5150,12 @@ async fn handle_model_command(
         if has_gemini {
             msg.push_str("\n<b>Gemini:</b>\n");
             msg.push_str("<code>/model gemini</code> — default\n");
-            msg.push_str("<code>/model gemini:gemini-3-pro</code> — Gemini 3 Pro\n");
-            msg.push_str("<code>/model gemini:gemini-3-flash</code> — Gemini 3 Flash\n");
+            msg.push_str("<code>/model gemini:gemini-3.1-flash-lite-preview</code> — Gemini 3.1 Flash Lite\n");
+            msg.push_str("<code>/model gemini:gemini-3-pro-preview</code> — Gemini 3 Pro\n");
+            msg.push_str("<code>/model gemini:gemini-3-flash-preview</code> — Gemini 3 Flash\n");
             msg.push_str("<code>/model gemini:gemini-2.5-pro</code> — Gemini 2.5 Pro\n");
             msg.push_str("<code>/model gemini:gemini-2.5-flash</code> — Gemini 2.5 Flash\n");
+            msg.push_str("<code>/model gemini:gemini-2.5-flash-lite</code> — Gemini 2.5 Flash Lite\n");
         }
         if has_opencode {
             msg.push_str("\n<b>OpenCode:</b>\n");

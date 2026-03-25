@@ -2733,13 +2733,12 @@ async fn handle_start_command(
     } else {
         // Session name/ID mode: resolve Claude Code session
         // Try current provider first, then cross-provider fallback
-        let other_provider = match provider {
-            SessionProvider::Claude => SessionProvider::Codex,
-            SessionProvider::Codex => SessionProvider::Claude,
-            SessionProvider::Gemini => SessionProvider::Claude,
-            SessionProvider::OpenCode => SessionProvider::Claude,
+        let fallback_providers: &[SessionProvider] = match provider {
+            SessionProvider::Claude   => &[SessionProvider::Codex, SessionProvider::Gemini, SessionProvider::OpenCode],
+            SessionProvider::Codex    => &[SessionProvider::Claude, SessionProvider::Gemini, SessionProvider::OpenCode],
+            SessionProvider::Gemini   => &[SessionProvider::Claude, SessionProvider::Codex, SessionProvider::OpenCode],
+            SessionProvider::OpenCode => &[SessionProvider::Claude, SessionProvider::Codex, SessionProvider::Gemini],
         };
-        let other_provider_str = session_provider_str(other_provider);
 
         // Helper closure: try resolve_session + ai_sessions for a given provider
         let try_resolve = |prov: SessionProvider, prov_str: &str| -> Option<String> {
@@ -2785,30 +2784,36 @@ async fn handle_start_command(
             msg_debug(&format!("[handle_start_command] resolved with current provider: path={}", cp));
             cp
         } else {
-            // Cross-provider fallback: only if the other provider is available
-            let other_available = match other_provider {
-                SessionProvider::Claude => claude::is_claude_available(),
-                SessionProvider::Codex => codex::is_codex_available(),
-                SessionProvider::Gemini => gemini::is_gemini_available(),
-                SessionProvider::OpenCode => opencode::is_opencode_available(),
-            };
-            msg_debug(&format!("[handle_start_command] cross-provider attempt: other={}, available={}", other_provider_str, other_available));
-            let cross_resolved = if other_available {
-                try_resolve(other_provider, other_provider_str)
-            } else {
-                msg_debug(&format!("[handle_start_command] cross-provider skip: {} not available", other_provider_str));
-                None
-            };
+            // Cross-provider fallback: try all other providers in order
+            let mut cross_result: Option<(String, SessionProvider, &'static str)> = None;
+            for &fp in fallback_providers {
+                let fp_str = session_provider_str(fp);
+                let available = match fp {
+                    SessionProvider::Claude => claude::is_claude_available(),
+                    SessionProvider::Codex => codex::is_codex_available(),
+                    SessionProvider::Gemini => gemini::is_gemini_available(),
+                    SessionProvider::OpenCode => opencode::is_opencode_available(),
+                };
+                if !available {
+                    msg_debug(&format!("[handle_start_command] cross-provider skip: {} not available", fp_str));
+                    continue;
+                }
+                msg_debug(&format!("[handle_start_command] cross-provider attempt: {}", fp_str));
+                if let Some(cp) = try_resolve(fp, fp_str) {
+                    cross_result = Some((cp, fp, fp_str));
+                    break;
+                }
+            }
 
-            if let Some(cp) = cross_resolved {
-                // Cross-provider fallback: switch provider and model to other provider's default
-                msg_debug(&format!("[handle_start_command] cross-provider fallback: switching from {} to {}", provider_str, other_provider_str));
-                provider = other_provider;
-                provider_str = other_provider_str;
+            if let Some((cp, resolved_prov, resolved_prov_str)) = cross_result {
+                // Cross-provider fallback: switch provider and model to resolved provider
+                msg_debug(&format!("[handle_start_command] cross-provider fallback: switching from {} to {}", provider_str, resolved_prov_str));
+                provider = resolved_prov;
+                provider_str = resolved_prov_str;
                 {
                     let mut data = state.lock().await;
-                    msg_debug(&format!("[handle_start_command] cross-provider: setting model to {:?}", other_provider_str));
-                    data.settings.models.insert(chat_id.0.to_string(), other_provider_str.to_string());
+                    msg_debug(&format!("[handle_start_command] cross-provider: setting model to {:?}", resolved_prov_str));
+                    data.settings.models.insert(chat_id.0.to_string(), resolved_prov_str.to_string());
                     save_bot_settings(token, &data.settings);
                     if let Some(session) = data.sessions.get_mut(&chat_id) {
                         msg_debug(&format!("[handle_start_command] cross-provider: clearing old session (len={}, sid={:?}, path={:?})",
@@ -3096,8 +3101,8 @@ fn resolve_session(query: &str, provider: SessionProvider) -> Option<ResolvedSes
         SessionProvider::Codex => {
             resolve_codex_by_id(query)
         }
-        SessionProvider::Gemini => None, // Gemini sessions managed by gemini CLI
-        SessionProvider::OpenCode => None, // OpenCode sessions managed by opencode CLI
+        SessionProvider::Gemini => resolve_gemini_by_id(query),
+        SessionProvider::OpenCode => resolve_opencode_by_id(query),
     };
     msg_debug(&format!("[resolve_session] result={}", match &result {
         Some(r) => format!("found(cwd={:?}, session_id={})", r.cwd, r.session_id),
@@ -3224,6 +3229,74 @@ fn resolve_codex_by_id(session_id: &str) -> Option<ResolvedSession> {
     })
 }
 
+/// Gemini: scan `~/.gemini/tmp/*/chats/session-*.json` for a matching sessionId.
+fn resolve_gemini_by_id(session_id: &str) -> Option<ResolvedSession> {
+    msg_debug(&format!("[resolve_gemini_by_id] session_id={}", session_id));
+    let tmp_dir = dirs::home_dir()?.join(".gemini").join("tmp");
+    if !tmp_dir.is_dir() {
+        msg_debug("[resolve_gemini_by_id] tmp_dir not found");
+        return None;
+    }
+    // Use first 8 chars of UUID for quick filename filtering (char-boundary safe)
+    let short_id: String = session_id.chars().take(8).collect();
+    for proj_entry in fs::read_dir(&tmp_dir).ok()?.flatten() {
+        if !proj_entry.file_type().map_or(false, |t| t.is_dir()) { continue; }
+        let chats_dir = proj_entry.path().join("chats");
+        if !chats_dir.is_dir() { continue; }
+        let Ok(chat_entries) = fs::read_dir(&chats_dir) else { continue; };
+        for chat_entry in chat_entries.flatten() {
+            let path = chat_entry.path();
+            let Some(fname) = path.file_name().and_then(|n| n.to_str()) else { continue; };
+            if !fname.starts_with("session-") || !fname.ends_with(".json") { continue; }
+            // Quick filter: filename contains first 8 chars of UUID
+            if !fname.contains(short_id.as_str()) { continue; }
+            // Parse JSON to verify full sessionId
+            let Ok(content) = fs::read_to_string(&path) else { continue; };
+            let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) else { continue; };
+            let sid = val.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+            if sid != session_id { continue; }
+            // Read .project_root from parent directory to get cwd
+            let project_root_file = proj_entry.path().join(".project_root");
+            let cwd = fs::read_to_string(&project_root_file).ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())?;
+            msg_debug(&format!("[resolve_gemini_by_id] found: cwd={:?}, file={}", cwd, path.display()));
+            return Some(ResolvedSession {
+                cwd, jsonl_path: path, session_id: session_id.to_string(),
+                provider: SessionProvider::Gemini,
+            });
+        }
+    }
+    msg_debug("[resolve_gemini_by_id] not found");
+    None
+}
+
+/// OpenCode: query `~/.local/share/opencode/opencode.db` for a matching session ID.
+fn resolve_opencode_by_id(session_id: &str) -> Option<ResolvedSession> {
+    msg_debug(&format!("[resolve_opencode_by_id] session_id={}", session_id));
+    let db_path = dirs::home_dir()?.join(".local").join("share").join("opencode").join("opencode.db");
+    if !db_path.is_file() {
+        msg_debug("[resolve_opencode_by_id] db not found");
+        return None;
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).ok()?;
+    let mut stmt = conn.prepare("SELECT id, directory FROM session WHERE id = ?1 LIMIT 1").ok()?;
+    let result = stmt.query_row(rusqlite::params![session_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }).ok()?;
+    let directory = result.1;
+    if directory.is_empty() { return None; }
+    msg_debug(&format!("[resolve_opencode_by_id] found: directory={:?}", directory));
+    Some(ResolvedSession {
+        cwd: directory,
+        jsonl_path: db_path,
+        session_id: session_id.to_string(),
+        provider: SessionProvider::OpenCode,
+    })
+}
+
 /// Convert an external JSONL session to cokacdir SessionData and save it.
 /// Re-converts if the source JSONL is newer than the existing JSON.
 fn convert_and_save_session(info: &ResolvedSession, canonical_path: &str) {
@@ -3253,8 +3326,8 @@ fn convert_and_save_session(info: &ResolvedSession, canonical_path: &str) {
     let parser = match info.provider {
         SessionProvider::Claude => parse_claude_jsonl,
         SessionProvider::Codex  => parse_codex_jsonl,
-        SessionProvider::Gemini => return, // Gemini sessions not stored locally
-        SessionProvider::OpenCode => return, // OpenCode sessions not stored locally
+        SessionProvider::Gemini => parse_gemini_json,
+        SessionProvider::OpenCode => parse_opencode_session,
     };
     msg_debug(&format!("[convert_session] parsing with provider={:?}", info.provider));
     let Some(session_data) = parser(&info.jsonl_path, &info.session_id, canonical_path) else {
@@ -3277,8 +3350,8 @@ fn find_latest_session_by_cwd(canonical_path: &str, provider: SessionProvider) -
     let result = match provider {
         SessionProvider::Claude => find_latest_claude_by_cwd(canonical_path),
         SessionProvider::Codex  => find_latest_codex_by_cwd(canonical_path),
-        SessionProvider::Gemini => None,
-        SessionProvider::OpenCode => None,
+        SessionProvider::Gemini => find_latest_gemini_by_cwd(canonical_path),
+        SessionProvider::OpenCode => find_latest_opencode_by_cwd(canonical_path),
     };
     msg_debug(&format!("[find_latest_by_cwd] result={}", if result.is_some() { "found" } else { "None" }));
     result
@@ -3380,6 +3453,68 @@ fn collect_best_codex_jsonl(
             }
         }
     }
+}
+
+/// Gemini: scan `~/.gemini/tmp/*/.project_root` for cwd match, find latest chat file.
+fn find_latest_gemini_by_cwd(canonical_path: &str) -> Option<ResolvedSession> {
+    msg_debug(&format!("[find_latest_gemini_by_cwd] canonical_path={:?}", canonical_path));
+    let tmp_dir = dirs::home_dir()?.join(".gemini").join("tmp");
+    if !tmp_dir.is_dir() { return None; }
+    let mut best_path: Option<std::path::PathBuf> = None;
+    let mut best_time = std::time::UNIX_EPOCH;
+    for proj_entry in fs::read_dir(&tmp_dir).ok()?.flatten() {
+        if !proj_entry.file_type().map_or(false, |t| t.is_dir()) { continue; }
+        let pr_file = proj_entry.path().join(".project_root");
+        let Ok(pr_content) = fs::read_to_string(&pr_file) else { continue; };
+        if pr_content.trim() != canonical_path { continue; }
+        let chats_dir = proj_entry.path().join("chats");
+        if !chats_dir.is_dir() { continue; }
+        let Ok(chat_entries) = fs::read_dir(&chats_dir) else { continue; };
+        for chat_entry in chat_entries.flatten() {
+            let path = chat_entry.path();
+            let Some(fname) = path.file_name().and_then(|n| n.to_str()) else { continue; };
+            if !fname.starts_with("session-") || !fname.ends_with(".json") { continue; }
+            let mtime = path.metadata().ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            if mtime > best_time {
+                best_path = Some(path);
+                best_time = mtime;
+            }
+        }
+    }
+    let jsonl_path = best_path?;
+    let content = fs::read_to_string(&jsonl_path).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let session_id = val.get("sessionId").and_then(|v| v.as_str())?.to_string();
+    msg_debug(&format!("[find_latest_gemini_by_cwd] found: session_id={}, file={}", session_id, jsonl_path.display()));
+    Some(ResolvedSession {
+        cwd: canonical_path.to_string(), jsonl_path, session_id,
+        provider: SessionProvider::Gemini,
+    })
+}
+
+/// OpenCode: query SQLite DB for latest session matching cwd.
+fn find_latest_opencode_by_cwd(canonical_path: &str) -> Option<ResolvedSession> {
+    msg_debug(&format!("[find_latest_opencode_by_cwd] canonical_path={:?}", canonical_path));
+    let db_path = dirs::home_dir()?.join(".local").join("share").join("opencode").join("opencode.db");
+    if !db_path.is_file() { return None; }
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).ok()?;
+    let mut stmt = conn.prepare(
+        "SELECT id FROM session WHERE directory = ?1 ORDER BY time_updated DESC LIMIT 1"
+    ).ok()?;
+    let session_id: String = stmt.query_row(rusqlite::params![canonical_path], |row| {
+        row.get(0)
+    }).ok()?;
+    msg_debug(&format!("[find_latest_opencode_by_cwd] found: session_id={}", session_id));
+    Some(ResolvedSession {
+        cwd: canonical_path.to_string(),
+        jsonl_path: db_path,
+        session_id,
+        provider: SessionProvider::OpenCode,
+    })
 }
 
 /// Parse a Claude Code JSONL file into cokacdir SessionData.
@@ -3565,6 +3700,120 @@ fn parse_codex_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<S
         current_path: cwd.to_string(),
         created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         provider: "codex".to_string(),
+    })
+}
+
+/// Parse a Gemini CLI chat JSON file into cokacdir SessionData.
+fn parse_gemini_json(json_path: &Path, session_id: &str, cwd: &str) -> Option<SessionData> {
+    msg_debug(&format!("[parse_gemini_json] file={}, session_id={}", json_path.display(), session_id));
+    let content = fs::read_to_string(json_path).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let messages = val.get("messages")?.as_array()?;
+    let mut history: Vec<HistoryItem> = Vec::new();
+    for msg in messages {
+        let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match msg_type {
+            "user" => {
+                // User content is array of {text: "..."} objects
+                if let Some(arr) = msg.get("content").and_then(|v| v.as_array()) {
+                    for item in arr {
+                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                            let trimmed = text.trim();
+                            if !trimmed.is_empty() {
+                                history.push(HistoryItem {
+                                    item_type: HistoryType::User,
+                                    content: truncate_utf8(trimmed, 300),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            "gemini" => {
+                // Gemini content is a plain string
+                if let Some(text) = msg.get("content").and_then(|v| v.as_str()) {
+                    if !text.is_empty() {
+                        history.push(HistoryItem {
+                            item_type: HistoryType::Assistant,
+                            content: truncate_utf8(text, 2000),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if history.is_empty() { return None; }
+    msg_debug(&format!("[parse_gemini_json] parsed: history_len={}", history.len()));
+    Some(SessionData {
+        session_id: session_id.to_string(),
+        history,
+        current_path: cwd.to_string(),
+        created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        provider: "gemini".to_string(),
+    })
+}
+
+/// Parse an OpenCode session from SQLite DB into cokacdir SessionData.
+fn parse_opencode_session(db_path: &Path, session_id: &str, cwd: &str) -> Option<SessionData> {
+    msg_debug(&format!("[parse_opencode_session] db={}, session_id={}", db_path.display(), session_id));
+    if !db_path.is_file() { return None; }
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).ok()?;
+    let mut stmt = conn.prepare(
+        "SELECT json_extract(m.data, '$.role'), json_extract(p.data, '$.type'), \
+         json_extract(p.data, '$.text'), json_extract(p.data, '$.tool') \
+         FROM message m JOIN part p ON p.message_id = m.id \
+         WHERE m.session_id = ?1 ORDER BY p.time_created ASC"
+    ).ok()?;
+    let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    }).ok()?;
+    let mut history: Vec<HistoryItem> = Vec::new();
+    for row in rows.flatten() {
+        let role = row.0.as_deref().unwrap_or("");
+        let ptype = row.1.as_deref().unwrap_or("");
+        let text = row.2.as_deref().unwrap_or("");
+        let tool = row.3.as_deref().unwrap_or("Tool");
+        match ptype {
+            "text" => {
+                if text.is_empty() { continue; }
+                if role == "user" {
+                    history.push(HistoryItem {
+                        item_type: HistoryType::User,
+                        content: truncate_utf8(text.trim(), 300),
+                    });
+                } else if role == "assistant" {
+                    history.push(HistoryItem {
+                        item_type: HistoryType::Assistant,
+                        content: truncate_utf8(text, 2000),
+                    });
+                }
+            }
+            "tool" => {
+                history.push(HistoryItem {
+                    item_type: HistoryType::ToolUse,
+                    content: format!("[{}]", tool),
+                });
+            }
+            // Skip step-start, step-finish, reasoning
+            _ => {}
+        }
+    }
+    if history.is_empty() { return None; }
+    msg_debug(&format!("[parse_opencode_session] parsed: history_len={}", history.len()));
+    Some(SessionData {
+        session_id: session_id.to_string(),
+        history,
+        current_path: cwd.to_string(),
+        created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        provider: "opencode".to_string(),
     })
 }
 
@@ -3881,7 +4130,7 @@ async fn handle_session_command(
             let resume_cmd = match session_prov {
                 "codex" => format!("codex resume {}", id),
                 "gemini" => format!("gemini --resume {}", id),
-                "opencode" => format!("opencode run --session {} --continue", id),
+                "opencode" => format!("opencode -s {}", id),
                 _ => format!("claude --resume {}", id),
             };
             let provider = match session_prov { "codex" => "Codex", "gemini" => "Gemini", "opencode" => "OpenCode", _ => "Claude" };

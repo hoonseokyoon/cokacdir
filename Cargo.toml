@@ -42,6 +42,7 @@ ratatui-image = { version = "2.0", default-features = false, features = ["rustix
 teloxide = { version = "0.13", default-features = false, features = ["macros", "rustls", "ctrlc_handler"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 fs2 = "0.4"
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

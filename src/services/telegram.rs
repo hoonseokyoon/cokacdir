@@ -4561,11 +4561,9 @@ async fn handle_stop_queue_item(
         }
     };
 
-    shared_rate_limit_wait(state, chat_id).await;
     if let Some(id) = removed {
+        shared_rate_limit_wait(state, chat_id).await;
         tg!("send_message", bot.send_message(chat_id, &format!("Removed queued message ({id}).")).await)?;
-    } else {
-        tg!("send_message", bot.send_message(chat_id, &format!("Queue ID \"{queue_id}\" not found.")).await)?;
     }
     Ok(())
 }

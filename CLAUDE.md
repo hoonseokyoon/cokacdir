@@ -17,6 +17,14 @@ You can get Rust build methods from build_manual.md file
 - Do not use `cargo build`, `python3 build.py`, or any build commands unless user asks
 - Focus only on code modifications; user handles all builds manually
 
+### Self-Evolution Exception (conduktor)
+
+When the user explicitly authorizes self-evolution work on the conduktor project:
+- `cargo build` and `cargo test` are allowed for verification after code changes
+- Build failures must be immediately reverted (`git stash` or `git revert`) and reported to the user
+- Canary builds should target a separate path (e.g., `--target-dir ~/.conduktor/canary/`)
+- **Binary replacement still requires explicit user approval** — never auto-replace the running conduktor binary
+
 ## Version Management
 
 - Version is defined in `Cargo.toml` (line 3: `version = "x.x.x"`)
